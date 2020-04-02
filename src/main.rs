@@ -1,13 +1,8 @@
 mod tagfs;
 
 use chrono::Local;
+use std::ffi::{OsStr, OsString};
 use std::{env, io};
-/*
-use std::os::unix::fs::MetadataExt;
-use std::{env, fs, io};
-use walkdir::WalkDir;
-use std::path::PathBuf;
-*/
 
 use crate::tagfs::TagFS;
 
@@ -44,15 +39,12 @@ fn main() -> io::Result<()> {
 
     let tag_fs = TagFS::new(&args[1]);
 
-    /*
-    for a in env::args().skip(1) {
-        let r = scan(&a);
-        debug!("{:?}", r);
-    }
-    */
-
     debug!("Hi");
     trace!("Hello, world!");
     info!("bye");
+
+    let fuse_args: Vec<&OsStr> = vec![&OsStr::new("-o"), &OsStr::new("auto_unmount")];
+
+    fuse_mt::mount(fuse_mt::FuseMT::new(tag_fs, 1), &args[2], &fuse_args).unwrap();
     Ok(())
 }
