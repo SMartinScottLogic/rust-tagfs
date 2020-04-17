@@ -1,14 +1,18 @@
 use fuse_mt::{
     DirectoryEntry, FileAttr, FileType, FilesystemMT, RequestInfo, ResultEmpty, ResultEntry,
-    ResultOpen, ResultReaddir, Statfs,
+    ResultOpen, ResultReaddir, ResultXattr, Statfs, Xattr,
 };
-use std::collections::HashSet;
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component::Normal, Path, PathBuf};
 use time::Timespec;
 use walkdir::WalkDir;
+
+use crate::libc_wrapper;
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
@@ -44,12 +48,48 @@ impl TagFSEntry {
             tags: components,
         }
     }
+
+    fn stat(self: &Self) -> io::Result<FileAttr> {
+        let stat = libc_wrapper::lstat(&self.absolute)?;
+        Ok(Self::stat_to_fuse(stat))
+    }
+    fn stat_to_fuse(stat: libc::stat) -> FileAttr {
+        // st_mode encodes both the kind and the permissions
+        let kind = TagFS::mode_to_filetype(stat.st_mode);
+        let perm = (stat.st_mode & 0o7777) as u16;
+
+        FileAttr {
+            size: stat.st_size as u64,
+            blocks: stat.st_blocks as u64,
+            atime: Timespec {
+                sec: stat.st_atime as i64,
+                nsec: stat.st_atime_nsec as i32,
+            },
+            mtime: Timespec {
+                sec: stat.st_mtime as i64,
+                nsec: stat.st_mtime_nsec as i32,
+            },
+            ctime: Timespec {
+                sec: stat.st_ctime as i64,
+                nsec: stat.st_ctime_nsec as i32,
+            },
+            crtime: Timespec { sec: 0, nsec: 0 },
+            kind,
+            perm,
+            nlink: stat.st_nlink as u32,
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+            rdev: stat.st_rdev as u32,
+            flags: 0,
+        }
+    }
 }
 
 pub struct TagFS {
     root: String,
     tags: HashSet<OsString>,
     entries: Vec<TagFSEntry>,
+    attrs: HashMap<&'static str, &'static str>,
 }
 
 impl TagFS {
@@ -63,6 +103,9 @@ impl TagFS {
                 .flat_map(|tag_entry| tag_entry.tags.clone())
                 .collect(),
             entries,
+            attrs: vec![("user.tagfs.strategy", "0"), ("user.tagfs.depth", "1")]
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -98,29 +141,16 @@ impl TagFS {
             flags: 0,
         }
     }
-    /*
-        fn stat_to_fuse(stat: libc::stat) -> FileAttr {
-            // st_mode encodes both the kind and the permissions
-            let kind = TagFS::mode_to_filetype(stat.st_mode);
-            let perm = (stat.st_mode & 0o7777) as u16;
 
-            FileAttr {
-                size: stat.st_size as u64,
-                blocks: stat.st_blocks as u64,
-                atime: Timespec { sec: stat.st_atime as i64, nsec: stat.st_atime_nsec as i32 },
-                mtime: Timespec { sec: stat.st_mtime as i64, nsec: stat.st_mtime_nsec as i32 },
-                ctime: Timespec { sec: stat.st_ctime as i64, nsec: stat.st_ctime_nsec as i32 },
-                crtime: Timespec { sec: 0, nsec: 0 },
-                kind,
-                perm,
-                nlink: stat.st_nlink as u32,
-                uid: stat.st_uid,
-                gid: stat.st_gid,
-                rdev: stat.st_rdev as u32,
-                flags: 0,
-            }
-        }
-    */
+    fn tags(path: &Path) -> Option<Vec<OsString>> {
+        Some(
+            path.parent()?
+                .components()
+                .map(|comp| comp.as_os_str().to_owned())
+                .filter(|comp| comp != "/")
+                .collect(),
+        )
+    }
 }
 
 fn info(entry: &walkdir::DirEntry, meta: &std::fs::Metadata) {
@@ -179,6 +209,7 @@ impl FilesystemMT for TagFS {
     fn getattr(&self, _req: RequestInfo, path: &Path, fh: Option<u64>) -> ResultEntry {
         debug!("getattr: {:?} {:?}", path, fh);
 
+        debug!("TODO: lookup {:?} {:?}", path, Self::tags(path));
         Ok((TTL, TagFS::stat_to_fuse()))
         /*
 
@@ -212,6 +243,7 @@ impl FilesystemMT for TagFS {
             })
             .collect();
         debug!("components: {:?}", cur_tags);
+
         let mut entries: Vec<DirectoryEntry> = vec![];
         for tag in &self.tags {
             if !cur_tags.contains(tag) {
@@ -221,13 +253,19 @@ impl FilesystemMT for TagFS {
                 });
             }
         }
-        for entry in &self.entries {
-            if entry.tags.is_superset(&cur_tags) {
-                debug!("match {:?}", entry);
-                entries.push(DirectoryEntry {
-                    name: entry.name.to_os_string(),
-                    kind: FileType::RegularFile,
-                });
+
+        if cur_tags.len() > 0 {
+            for entry in &self.entries {
+                if entry.tags.is_superset(&cur_tags) {
+                    debug!("match {:?}", entry);
+                    entries.push(DirectoryEntry {
+                        name: OsString::from(
+                            format!("{:?} {:?}", entry.name, entry.absolute).replace("/", ":"),
+                        ),
+                        //name: entry.name.to_os_string(),
+                        kind: FileType::RegularFile,
+                    });
+                }
             }
         }
         /*
@@ -262,5 +300,69 @@ impl FilesystemMT for TagFS {
         */
         info!("entries: {:?}", entries);
         Ok(entries)
+    }
+
+    fn listxattr(self: &Self, _req: RequestInfo, path: &Path, size: u32) -> ResultXattr {
+        debug!("listxattr({:?}, {})", path, size);
+
+        if size == 0 {
+			let size: usize = self.attrs.iter().map(|(name, value)| name.len()).sum();
+            return Ok(Xattr::Size(size as u32));
+        }
+        print!(
+            "{:?}",
+            self.attrs
+                .iter()
+                .map(|(name, value)| name.as_bytes())
+                .collect::<Vec<_>>()
+                .join(&0_u8)
+        );
+        //print!("{:?}", attrs.iter().flat_map(|attr| attr.as_bytes().to_vec().push(0_u8)).collect::<Vec<_>>());
+        let mut data = self
+            .attrs
+            .iter()
+            .map(|(name, value)| name.as_bytes())
+            .collect::<Vec<_>>()
+            .join(&0_u8);
+        data.push(0_u8);
+        Ok(Xattr::Data(data))
+    }
+
+    fn getxattr(&self, _req: RequestInfo, path: &Path, name: &OsStr, size: u32) -> ResultXattr {
+        debug!("getxattr: {:?} {:?} {}", path, name, size);
+
+        if size == 0 {
+            return Ok(Xattr::Size(
+                self.attrs
+                    .get(&name.to_str().unwrap_or(&""))
+                    .map_or(0, |a| a.len()) as u32,
+            ));
+        }
+
+        let data = match self.attrs.get(&name.to_str().unwrap_or(&"")) {
+            Some(&v) => v.as_bytes().to_vec(),
+            _ => Vec::new(),
+        };
+        Ok(Xattr::Data(data))
+    }
+
+    fn setxattr(
+        &self,
+        _req: RequestInfo,
+        path: &Path,
+        name: &OsStr,
+        value: &[u8],
+        flags: u32,
+        position: u32,
+    ) -> ResultEmpty {
+        debug!(
+            "setxattr: {:?} {:?} {} bytes, flags = {:#x}, pos = {}",
+            path,
+            name,
+            value.len(),
+            flags,
+            position
+        );
+        Err(libc::ENOATTR)
     }
 }
