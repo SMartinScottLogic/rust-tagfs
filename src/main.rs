@@ -2,7 +2,7 @@ mod libc_wrapper;
 mod tagfs;
 
 use chrono::Local;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::{env, io};
 
 use crate::tagfs::TagFS;
@@ -44,7 +44,7 @@ fn main() -> io::Result<()> {
     trace!("Hello, world!");
     info!("bye");
 
-    let fuse_args: Vec<&OsStr> = vec![&OsStr::new("-o"), &OsStr::new("auto_unmount")];
+    let fuse_args: Vec<&OsStr> = vec![OsStr::new("-o"), OsStr::new("auto_unmount")];
 
     fuse_mt::mount(fuse_mt::FuseMT::new(tag_fs, 1), &args[2], &fuse_args).unwrap();
     Ok(())

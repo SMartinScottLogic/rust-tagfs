@@ -1,20 +1,19 @@
 use fuse_mt::{
     DirectoryEntry, FileAttr, FileType, FilesystemMT, RequestInfo, ResultEmpty, ResultEntry,
-    ResultOpen, ResultReaddir, ResultXattr, Statfs, Xattr,
+    ResultOpen, ResultReaddir, ResultXattr, Xattr,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component::Normal, Path, PathBuf};
-use time::Timespec;
+use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 use crate::libc_wrapper;
 
-const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
+const TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct TagFSEntry {
@@ -49,7 +48,7 @@ impl TagFSEntry {
         }
     }
 
-    fn stat(self: &Self) -> io::Result<FileAttr> {
+    fn stat(&self) -> io::Result<FileAttr> {
         let stat = libc_wrapper::lstat(&self.absolute)?;
         Ok(Self::stat_to_fuse(stat))
     }
@@ -61,19 +60,16 @@ impl TagFSEntry {
         FileAttr {
             size: stat.st_size as u64,
             blocks: stat.st_blocks as u64,
-            atime: Timespec {
-                sec: stat.st_atime as i64,
-                nsec: stat.st_atime_nsec as i32,
-            },
-            mtime: Timespec {
-                sec: stat.st_mtime as i64,
-                nsec: stat.st_mtime_nsec as i32,
-            },
-            ctime: Timespec {
-                sec: stat.st_ctime as i64,
-                nsec: stat.st_ctime_nsec as i32,
-            },
-            crtime: Timespec { sec: 0, nsec: 0 },
+            atime: SystemTime::UNIX_EPOCH
+                + Duration::from_secs(stat.st_atime as u64)
+                + Duration::from_nanos(stat.st_atime_nsec as u64),
+            mtime: SystemTime::UNIX_EPOCH
+                + Duration::from_secs(stat.st_mtime as u64)
+                + Duration::from_nanos(stat.st_mtime_nsec as u64),
+            ctime: SystemTime::UNIX_EPOCH
+                + Duration::from_secs(stat.st_ctime as u64)
+                + Duration::from_nanos(stat.st_ctime_nsec as u64),
+            crtime: SystemTime::UNIX_EPOCH,
             kind,
             perm,
             nlink: stat.st_nlink as u32,
@@ -128,10 +124,10 @@ impl TagFS {
         FileAttr {
             size: 0,
             blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            crtime: Timespec { sec: 0, nsec: 0 },
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            crtime: SystemTime::UNIX_EPOCH,
             kind: FileType::Directory,
             perm: 0o0755,
             nlink: 1,
@@ -183,7 +179,7 @@ fn process(root: &str, entry: &walkdir::DirEntry) -> Option<TagFSEntry> {
     //info(&entry, &meta);
     if meta.is_file() {
         if let Some(_p) = entry.path().parent() {
-            return Some(TagFSEntry::new(&root, &entry, &meta));
+            return Some(TagFSEntry::new(root, entry, &meta));
         }
     };
     None
@@ -192,7 +188,7 @@ fn process(root: &str, entry: &walkdir::DirEntry) -> Option<TagFSEntry> {
 fn scan(root: &str) -> Vec<TagFSEntry> {
     WalkDir::new(root)
         .into_iter()
-        .filter_map(|entry| entry.ok().map(|entry| process(&root, &entry)).flatten())
+        .filter_map(|entry| entry.ok().and_then(|entry| process(root, &entry)))
         .collect()
 }
 
@@ -202,7 +198,7 @@ impl FilesystemMT for TagFS {
         Ok(())
     }
 
-    fn destroy(&self, _req: RequestInfo) {
+    fn destroy(&self) {
         debug!("destroy");
     }
 
@@ -254,13 +250,13 @@ impl FilesystemMT for TagFS {
             }
         }
 
-        if cur_tags.len() > 0 {
+        if !cur_tags.is_empty() {
             for entry in &self.entries {
                 if entry.tags.is_superset(&cur_tags) {
                     debug!("match {:?}", entry);
                     entries.push(DirectoryEntry {
                         name: OsString::from(
-                            format!("{:?} {:?}", entry.name, entry.absolute).replace("/", ":"),
+                            format!("{:?} {:?}", entry.name, entry.absolute).replace('/', ":"),
                         ),
                         //name: entry.name.to_os_string(),
                         kind: FileType::RegularFile,
@@ -302,26 +298,26 @@ impl FilesystemMT for TagFS {
         Ok(entries)
     }
 
-    fn listxattr(self: &Self, _req: RequestInfo, path: &Path, size: u32) -> ResultXattr {
+    fn listxattr(&self, _req: RequestInfo, path: &Path, size: u32) -> ResultXattr {
         debug!("listxattr({:?}, {})", path, size);
 
         if size == 0 {
-			let size: usize = self.attrs.iter().map(|(name, value)| name.len()).sum();
+            let size: usize = self.attrs.keys().map(|name| name.len()).sum();
             return Ok(Xattr::Size(size as u32));
         }
         print!(
             "{:?}",
             self.attrs
-                .iter()
-                .map(|(name, value)| name.as_bytes())
+                .keys()
+                .map(|name| name.as_bytes())
                 .collect::<Vec<_>>()
                 .join(&0_u8)
         );
         //print!("{:?}", attrs.iter().flat_map(|attr| attr.as_bytes().to_vec().push(0_u8)).collect::<Vec<_>>());
         let mut data = self
             .attrs
-            .iter()
-            .map(|(name, value)| name.as_bytes())
+            .keys()
+            .map(|name| name.as_bytes())
             .collect::<Vec<_>>()
             .join(&0_u8);
         data.push(0_u8);
@@ -334,12 +330,12 @@ impl FilesystemMT for TagFS {
         if size == 0 {
             return Ok(Xattr::Size(
                 self.attrs
-                    .get(&name.to_str().unwrap_or(&""))
+                    .get(&name.to_str().unwrap_or(""))
                     .map_or(0, |a| a.len()) as u32,
             ));
         }
 
-        let data = match self.attrs.get(&name.to_str().unwrap_or(&"")) {
+        let data = match self.attrs.get(&name.to_str().unwrap_or("")) {
             Some(&v) => v.as_bytes().to_vec(),
             _ => Vec::new(),
         };
@@ -363,6 +359,6 @@ impl FilesystemMT for TagFS {
             flags,
             position
         );
-        Err(libc::ENOATTR)
+        Err(libc::ENODATA)
     }
 }
